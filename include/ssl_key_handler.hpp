@@ -10,6 +10,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+// Common SNI hostname for mTLS
+constexpr const char* kMtlsSniHostname = "mtls.bmc";
 
 namespace ensuressl
 {

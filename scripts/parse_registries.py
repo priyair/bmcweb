@@ -232,7 +232,7 @@ def get_response_code(entry_id: str) -> str | None:
         "Created": "created",
         "EventSubscriptionLimitExceeded": "service_unavailable",
         "GeneralError": "internal_server_error",
-        "GenerateSecretKeyRequired": "forbidden",
+        "GenerateSecretKeyRequired": None,
         "InsufficientPrivilege": "forbidden",
         "InsufficientStorage": "insufficient_storage",
         "InstallFailed": "internal_server_error",
@@ -245,13 +245,16 @@ def get_response_code(entry_id: str) -> str | None:
         "OperationNotAllowed": "method_not_allowed",
         "OperationTimeout": "internal_server_error",
         "PasswordChangeRequired": None,
+        "InvalidUpload": "bad_request",
         "PreconditionFailed": "precondition_failed",
         "PropertyNotWritable": "method_not_allowed",
         "PropertyValueExternalConflict": "conflict",
         "PropertyValueModified": "ok",
         "PropertyValueResourceConflict": "conflict",
+        "ResourceAlreadyExists": "conflict",
         "ResourceAtUriUnauthorized": "unauthorized",
         "ResourceCannotBeDeleted": "method_not_allowed",
+        "ResourceCreationConflict": "conflict",
         "ResourceExhaustion": "service_unavailable",
         "ResourceInStandby": "service_unavailable",
         "ResourceInUse": "service_unavailable",
@@ -364,7 +367,11 @@ def make_error_function(
             arg_param = f"std::to_array{to_array_type}({{{argstring}}})"
         out += f"    return getLog(redfish::registries::{struct_name}::Index::{function_name}, {arg_param});"
         out += "\n}\n\n"
-    if registry_name == "Base" or registry_name == "License":
+    if (
+        registry_name == "Base"
+        or registry_name == "License"
+        or registry_name == "Openbmc"
+    ):
         args.insert(0, "crow::Response& res")
         if entry_id == "InternalError":
             if is_header:
@@ -394,9 +401,7 @@ def make_error_function(
 
             addMessageToJson = {
                 "PropertyDuplicate": 1,
-                "ResourceAlreadyExists": 2,
                 "CreateFailedMissingReqProperties": 1,
-                "PropertyValueFormatError": 2,
                 "PropertyValueNotInList": 2,
                 "PropertyValueTypeError": 2,
                 "PropertyValueError": 1,
@@ -412,6 +417,7 @@ def make_error_function(
                 "Created",
                 "Success",
                 "PasswordChangeRequired",
+                "GenerateSecretKeyRequired",
             ]
 
             if entry_id in addMessageToJson:
@@ -517,7 +523,7 @@ namespace messages
             headers.append("<boost/beast/http/status.hpp>")
             headers.append("<boost/url/url_view_base.hpp>")
             headers.append("<source_location>")
-        elif registry_name == "License":
+        elif registry_name == "License" or registry_name == "Openbmc":
             headers.append('"error_message_utils.hpp"')
             headers.append('"http_response.hpp"')
             headers.append("<boost/beast/http/status.hpp>")
@@ -529,7 +535,12 @@ namespace messages
         headers.append("<cstddef>")
         headers.append("<span>")
 
-        if registry_name not in ("ResourceEvent", "HeartbeatEvent", "License"):
+        if registry_name not in (
+            "ResourceEvent",
+            "HeartbeatEvent",
+            "License",
+            "Openbmc",
+        ):
             headers.append("<cstdint>")
             headers.append("<string>")
         headers.append("<string_view>")
@@ -725,6 +736,13 @@ def main() -> None:
             "Base",
             "base",
             "error",
+        )
+    if "openbmc" in registries_map:
+        create_error_registry(
+            registries_map["openbmc"],
+            "Openbmc",
+            "openbmc",
+            "openbmc",
         )
     if "heartbeat_event" in registries_map:
         create_error_registry(

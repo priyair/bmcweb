@@ -61,6 +61,7 @@
 #include <format>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -149,7 +150,7 @@ inline bool doUpdateErrorLoggingEntry(
     const std::shared_ptr<task::TaskData>& taskData, const std::string& index,
     const dbus::utility::DBusPropertiesMap& properties)
 {
-    using AdditionalDataType = std::vector<std::string>;
+    using AdditionalDataType = std::map<std::string, std::string>;
 
     const AdditionalDataType* addData = nullptr;
     const std::string* message = nullptr;
@@ -191,10 +192,9 @@ inline bool doUpdateErrorLoggingEntry(
     }
 
     std::string addDataStr;
-    for (const auto& data : *addData)
+    for (const auto& [key, value] : *addData)
     {
-        addDataStr.append(data);
-        addDataStr.append(" ");
+        addDataStr.append(std::format("{}={} ", key, value));
     }
 
     if (!message->empty() && !addDataStr.empty() && !eventId->empty())
@@ -429,6 +429,31 @@ inline void softwareInterfaceAdded(
     }
 }
 
+// TODO(Gunnar): Remove this 6/15/26
+inline void createBMCDump()
+{
+    std::vector<std::pair<std::string, std::variant<std::string, uint64_t>>>
+        createDumpParamVec;
+
+    createDumpParamVec.emplace_back(
+        "xyz.openbmc_project.Dump.Create.CreateParameters.OriginatorId",
+        "bmcweb-internal");
+    createDumpParamVec.emplace_back(
+        "xyz.openbmc_project.Dump.Create.CreateParameters.OriginatorType",
+        "xyz.openbmc_project.Common.OriginatedBy.OriginatorTypes.Internal");
+
+    crow::connections::systemBus->async_method_call(
+        [](const boost::system::error_code& ec) {
+            if (ec)
+            {
+                BMCWEB_LOG_ERROR("Failed to do a dump:{}", ec.value());
+                return;
+            }
+        },
+        "xyz.openbmc_project.Dump.Manager", "/xyz/openbmc_project/dump/bmc",
+        "xyz.openbmc_project.Dump.Create", "CreateDump", createDumpParamVec);
+}
+
 inline void afterAvailbleTimerAsyncWait(
     const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
     const boost::system::error_code& ec)
@@ -441,6 +466,9 @@ inline void afterAvailbleTimerAsyncWait(
     }
     BMCWEB_LOG_ERROR("Timed out waiting for firmware object being created");
     BMCWEB_LOG_ERROR("FW image may has already been uploaded to server");
+    // TODO(Gunnar): Remove this 6/15/26, this is here to try to figure what is
+    // slowing down the system so much.
+    createBMCDump();
     if (ec)
     {
         BMCWEB_LOG_ERROR("Async_wait failed{}", ec);
@@ -1245,8 +1273,8 @@ inline void handleUpdateServiceGet(
     asyncResp->res.jsonValue["MaxImageSizeBytes"] =
         BMCWEB_HTTP_BODY_LIMIT * 1024 * 1024;
     nlohmann::json& updateSvcConUpdate =
-        asyncResp->res.jsonValue["Actions"]["Oem"]
-                                ["#OemUpdateService.v1_0_0.ConcurrentUpdate"];
+        asyncResp->res
+            .jsonValue["Actions"]["Oem"]["#OemUpdateService.ConcurrentUpdate"];
     updateSvcConUpdate["target"] =
         "/redfish/v1/UpdateService/Actions/Oem/OemUpdateService.ConcurrentUpdate";
 
@@ -1385,6 +1413,7 @@ inline void getSoftwareVersion(
                const dbus::utility::DBusPropertiesMap& propertiesList) {
             if (ec)
             {
+                BMCWEB_LOG_ERROR("D-Bus error {}", ec);
                 messages::internalError(asyncResp->res);
                 return;
             }
@@ -1465,6 +1494,7 @@ inline void handleUpdateServiceFirmwareInventoryGet(
             BMCWEB_LOG_DEBUG("doGet callback...");
             if (ec)
             {
+                BMCWEB_LOG_ERROR("D-Bus error {}", ec);
                 messages::internalError(asyncResp->res);
                 return;
             }

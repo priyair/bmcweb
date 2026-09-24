@@ -46,48 +46,39 @@ class Server
     using self_t = Server<Handler, Adaptor>;
 
   public:
-    Server(Handler* handlerIn, std::vector<Acceptor>&& acceptorsIn) :
+    Server(Handler* handlerIn, std::vector<Acceptor>&& acceptorsIn,
+           std::function<std::shared_ptr<boost::asio::ssl::context>()>
+               contextFactory = ensuressl::getSslServerContext) :
+        getCachedDateStr(std::bind_front(&self_t::getCachedDateStrImpl, this)),
         acceptors(std::move(acceptorsIn)),
 
         // NOLINTNEXTLINE(misc-include-cleaner)
-        signals(getIoContext(), SIGINT, SIGTERM, SIGHUP), handler(handlerIn)
+        signals(getIoContext(), SIGINT, SIGTERM, SIGHUP), handler(handlerIn),
+        sslContextFactory(std::move(contextFactory))
     {
-        if constexpr (BMCWEB_IBM_MANAGEMENT_CONSOLE)
-        {
-            signals.add(SIGUSR1);
-        }
+        // NOLINTNEXTLINE(misc-include-cleaner)
+        signals.add(SIGUSR1);
     }
-
-    void updateDateStr()
+    std::string getCachedDateStrImpl()
     {
-        time_t lastTimeT = time(nullptr);
-        tm myTm{};
-
-        gmtime_r(&lastTimeT, &myTm);
-
-        dateStr.resize(100);
-        size_t dateStrSz = strftime(dateStr.data(), dateStr.size() - 1,
-                                    "%a, %d %b %Y %H:%M:%S GMT", &myTm);
-        dateStr.resize(dateStrSz);
+        std::chrono::steady_clock::time_point now =
+            std::chrono::steady_clock::now();
+        if (now - lastDateUpdate >= std::chrono::seconds(10))
+        {
+            lastDateUpdate = now;
+            using std::chrono::floor;
+            using std::chrono::seconds;
+            using std::chrono::system_clock;
+            std::chrono::time_point<system_clock, seconds> systemNow =
+                floor<seconds>(system_clock::now());
+            dateStr = std::format("{:%a, %d %b %Y %H:%M:%S GMT}", systemNow);
+        }
+        return dateStr;
     }
 
     void run()
     {
         loadCertificate();
-        updateDateStr();
-
-        getCachedDateStr = [this]() -> std::string {
-            static std::chrono::time_point<std::chrono::steady_clock>
-                lastDateUpdate = std::chrono::steady_clock::now();
-            if (std::chrono::steady_clock::now() - lastDateUpdate >=
-                std::chrono::seconds(10))
-            {
-                lastDateUpdate = std::chrono::steady_clock::now();
-                updateDateStr();
-            }
-            return dateStr;
-        };
-
         for (const Acceptor& accept : acceptors)
         {
             BMCWEB_LOG_INFO(
@@ -105,7 +96,11 @@ class Server
             return;
         }
 
-        adaptorCtx = ensuressl::getSslServerContext();
+        // Use the factory function to create SSL context
+        if (sslContextFactory)
+        {
+            adaptorCtx = sslContextFactory();
+        }
     }
 
     void startAsyncWaitForSignal()
@@ -196,9 +191,12 @@ class Server
     boost::asio::signal_set signals;
 
     std::string dateStr;
+    std::chrono::steady_clock::time_point lastDateUpdate;
 
     Handler* handler;
 
     std::shared_ptr<boost::asio::ssl::context> adaptorCtx;
+    std::function<std::shared_ptr<boost::asio::ssl::context>()>
+        sslContextFactory;
 };
 } // namespace crow

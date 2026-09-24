@@ -2116,23 +2116,60 @@ inline void dBusEventLogEntryGet(
                         urlLogEntryPrefix, hidden));
 }
 
+inline void updateManagementSystemAckProperty(
+    const std::optional<bool>& resolved,
+    const std::optional<bool>& managementSystemAck,
+    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+    const std::string& entryId)
+{
+    if (resolved.has_value())
+    {
+        setDbusProperty(asyncResp, "Resolved", "xyz.openbmc_project.Logging",
+                        "/xyz/openbmc_project/logging/entry/" + entryId,
+                        "xyz.openbmc_project.Logging.Entry", "Resolved",
+                        *resolved);
+    }
+
+    if (managementSystemAck.has_value())
+    {
+        BMCWEB_LOG_DEBUG("Updated ManagementSystemAck Property");
+        setDbusProperty(asyncResp, "ManagementSystemAck",
+                        "xyz.openbmc_project.Logging",
+                        "/xyz/openbmc_project/logging/entry/" + entryId,
+                        "org.open_power.Logging.PEL.Entry",
+                        "ManagementSystemAck", *managementSystemAck);
+    }
+}
+
 inline void dBusEventLogEntryPatch(
     const crow::Request& req,
     const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
     const std::string& entryId)
 {
     std::optional<bool> resolved;
-
-    if (!json_util::readJsonPatch(req, asyncResp->res, "Resolved", resolved))
+    std::optional<bool> managementSystemAck;
+    if (!json_util::readJsonPatch(
+            req, asyncResp->res,                                   //
+            "Resolved", resolved,                                  //
+            "Oem/OpenBMC/ManagementSystemAck", managementSystemAck //
+            ))
     {
         return;
     }
-    BMCWEB_LOG_DEBUG("Set Resolved");
 
-    setDbusProperty(asyncResp, "Resolved", "xyz.openbmc_project.Logging",
-                    "/xyz/openbmc_project/logging/entry/" + entryId,
-                    "xyz.openbmc_project.Logging.Entry", "Resolved",
-                    resolved.value_or(false));
+    error_log_utils::getHiddenPropertyValue(
+        asyncResp, entryId,
+        [resolved, managementSystemAck, asyncResp,
+         entryId](const std::optional<bool>& hiddenPropVal) {
+            if (hiddenPropVal.value_or(true))
+            {
+                // 'hiddenPropVal' is true if it is not an EventLog record
+                messages::resourceNotFound(asyncResp->res, "LogEntry", entryId);
+                return;
+            }
+            updateManagementSystemAckProperty(resolved, managementSystemAck,
+                                              asyncResp, entryId);
+        });
 }
 
 inline void dBusEventLogEntryDelete(
@@ -2747,10 +2784,11 @@ inline void handleLogServicesDumpClearLogComputerSystemPost(
 
 inline void displayOemPelAttachment(
     const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
-    const std::string& entryID)
+    const boost::urls::url& urlLogEntryPrefix, const std::string& entryID)
 {
-    auto respHandler = [asyncResp, entryID](const boost::system::error_code& ec,
-                                            const std::string& pelJson) {
+    auto respHandler = [asyncResp, urlLogEntryPrefix,
+                        entryID](const boost::system::error_code& ec,
+                                 const std::string& pelJson) {
         if (ec.value() == EBADR)
         {
             messages::resourceNotFound(asyncResp->res, "OemPelAttachment",
@@ -2763,6 +2801,14 @@ inline void displayOemPelAttachment(
             messages::internalError(asyncResp->res);
             return;
         }
+
+        asyncResp->res.jsonValue["@odata.id"] = boost::urls::format(
+            "{}/{}/OemPelAttachment", urlLogEntryPrefix, entryID);
+        asyncResp->res.jsonValue["@odata.type"] =
+            "#IBMLogEntryAttachment.v1_0_0.IBMLogEntryAttachment";
+
+        asyncResp->res.jsonValue["Name"] = "OemPelAttachment";
+        asyncResp->res.jsonValue["Id"] = "OemPelAttachment";
 
         asyncResp->res.jsonValue["Oem"]["IBM"]["PelJson"] = pelJson;
         asyncResp->res.jsonValue["Oem"]["IBM"]["@odata.type"] =
@@ -2831,7 +2877,11 @@ inline void requestRoutesDBusEventLogEntryDownloadPelJson(App& app)
                                                        "LogEntry", entryID);
                             return;
                         }
-                        displayOemPelAttachment(asyncResp, entryID);
+                        boost::urls::url urlLogEntryPrefix = boost::urls::format(
+                            "/redfish/v1/Systems/{}/LogServices/EventLog/Entries",
+                            BMCWEB_REDFISH_SYSTEM_URI_NAME);
+                        displayOemPelAttachment(asyncResp, urlLogEntryPrefix,
+                                                entryID);
                     });
             });
 }

@@ -15,10 +15,13 @@
 #include "logging.hpp"
 #include "query.hpp"
 #include "registries/privilege_registry.hpp"
+#include "task.hpp"
+#include "task_messages.hpp"
 #include "utils/assembly_utils.hpp"
 #include "utils/asset_utils.hpp"
 #include "utils/json_utils.hpp"
 #include "utils/name_utils.hpp"
+#include "utils/resource_utils.hpp"
 
 #include <asm-generic/errno.h>
 
@@ -29,7 +32,9 @@
 #include <nlohmann/json.hpp>
 #include <sdbusplus/asio/property.hpp>
 
+#include <chrono>
 #include <cstddef>
+#include <format>
 #include <functional>
 #include <map>
 #include <memory>
@@ -42,6 +47,251 @@
 
 namespace redfish
 {
+
+static constexpr std::string_view cmBasePath = "/com/ibm/ConcurrentMaintenance";
+static constexpr std::string_view cmAddPath =
+    "/com/ibm/ConcurrentMaintenance/add";
+static constexpr std::string_view cmRemovePath =
+    "/com/ibm/ConcurrentMaintenance/remove";
+static constexpr std::string_view cmProgressIface =
+    "xyz.openbmc_project.Common.Progress";
+// Maximum time to wait for the CM daemon to respond before task is set to
+// exception state
+static constexpr int cmTaskTimeoutMinutes = 30;
+
+/**
+ * @brief Map a Common.Progress Status value to a Redfish task terminal state.
+ * @return true when terminal, false when still in progress.
+ */
+inline bool mapCmStatus(const std::string& status,
+                        const std::shared_ptr<task::TaskData>& taskData)
+{
+    constexpr std::string_view completed =
+        "xyz.openbmc_project.Common.Progress.OperationStatus.Completed";
+    constexpr std::string_view failed =
+        "xyz.openbmc_project.Common.Progress.OperationStatus.Failed";
+    constexpr std::string_view aborted =
+        "xyz.openbmc_project.Common.Progress.OperationStatus.Aborted";
+    constexpr std::string_view inProgress =
+        "xyz.openbmc_project.Common.Progress.OperationStatus.InProgress";
+
+    if (status == completed)
+    {
+        taskData->messages.emplace_back(
+            messages::taskCompletedOK(std::to_string(taskData->index)));
+        taskData->state = "Completed";
+        taskData->status = "OK";
+        return true;
+    }
+    if (status == failed || status == aborted)
+    {
+        taskData->messages.emplace_back(
+            messages::taskAborted(std::to_string(taskData->index)));
+        taskData->state = "Exception";
+        taskData->status = "Warning";
+        return true;
+    }
+    if (status != inProgress)
+    {
+        BMCWEB_LOG_WARNING("CM task: unexpected Progress.Status value: {}",
+                           status);
+    }
+    return false;
+}
+
+/**
+ * @brief Check whether a CM operation is already in progress by looking for
+ *        object under /com/ibm/ConcurrentMaintenance.
+ * Calls onClear() when none exists.  Returns 503 resourceInUse if busy.
+ *
+ * @param asyncResp     Shared response, used only to set the error if busy.
+ * @param inventoryPath Inventory path logged in the error message.
+ * @param onClear       Callback invoked when CM is confirmed not busy.
+ */
+inline void checkCmNotBusy(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+                           const std::string& inventoryPath,
+                           std::function<void()> onClear)
+{
+    dbus::utility::getSubTreePaths(
+        std::string(cmBasePath), 1, std::array<std::string_view, 0>{},
+        [asyncResp, inventoryPath, onClear = std::move(onClear)](
+            const boost::system::error_code& ec,
+            const dbus::utility::MapperGetSubTreePathsResponse& paths) {
+            if (ec)
+            {
+                BMCWEB_LOG_ERROR(
+                    "getSubTreePaths failed for CM busy check on {}: {}",
+                    inventoryPath, ec.message());
+                messages::internalError(asyncResp->res);
+                return;
+            }
+            if (!paths.empty())
+            {
+                BMCWEB_LOG_ERROR(
+                    "CM is busy ({}): rejecting PATCH ReadyToRemove on {}",
+                    paths.front(), inventoryPath);
+                messages::resourceInUse(asyncResp->res);
+                return;
+            }
+            onClear();
+        });
+}
+
+/**
+ * @brief Task callback passed to TaskData::createTask to monitor CM progress.
+ *        Watches PropertiesChanged signals on the CM D-Bus object and maps
+ *        the Common.Progress Status value to a Redfish task terminal state.
+ *
+ * @return true (task::completed) when a terminal state is reached or on
+ *         timeout; false otherwise.
+ */
+inline bool cmTaskCallback(const boost::system::error_code& ec,
+                           sdbusplus::message_t& msg,
+                           const std::shared_ptr<task::TaskData>& taskData)
+{
+    // ec is only ever set on timer expiry; it's set to operation_aborted
+    if (ec)
+    {
+        BMCWEB_LOG_ERROR("CM task timed out for task {}", taskData->index);
+        return task::completed;
+    }
+
+    std::string iface;
+    dbus::utility::DBusPropertiesMap values;
+    msg.read(iface, values);
+
+    if (iface != cmProgressIface)
+    {
+        return !task::completed;
+    }
+    for (const auto& [propName, propVal] : values)
+    {
+        if (propName != "Status")
+        {
+            continue;
+        }
+        const std::string* status = std::get_if<std::string>(&propVal);
+        if (status != nullptr && mapCmStatus(*status, taskData))
+        {
+            return task::completed;
+        }
+    }
+    return !task::completed;
+}
+
+/**
+ * @brief Called after resolving the service that owns the ReadyToRemove
+ *        interface on the inventory object.  Creates the CM task and writes
+ *        the ReadyToRemove property to kick off the CM operation.
+ *
+ * @param asyncResp     Shared response, populateResp() sets 202 Accepted.
+ * @param payload       Task payload built from the original PATCH request.
+ * @param inventoryPath D-Bus object path of the inventory FRU.
+ * @param readyToRemove true: remove flow; false: add flow.
+ * @param ec            Error code from getDbusObject.
+ * @param object        Service-to-interfaces map returned by getDbusObject.
+ */
+inline void afterResolveReadyToRemoveService(
+    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+    task::Payload&& payload, const std::string& inventoryPath,
+    bool readyToRemove, const boost::system::error_code& ec,
+    const dbus::utility::MapperGetObject& object)
+{
+    if (ec || object.empty())
+    {
+        BMCWEB_LOG_ERROR("getDbusObject failed for ReadyToRemove on {}: {}",
+                         inventoryPath, ec.message());
+        messages::internalError(asyncResp->res);
+        return;
+    }
+
+    const std::string service = object.begin()->first;
+
+    const std::string_view cmObjPath = readyToRemove ? cmRemovePath : cmAddPath;
+    const std::string matchStr = std::format(
+        "type='signal',"
+        "interface='org.freedesktop.DBus.Properties',"
+        "member='PropertiesChanged',"
+        "path='{}'",
+        cmObjPath);
+
+    std::shared_ptr<task::TaskData> taskHandle =
+        task::TaskData::createTask(cmTaskCallback, matchStr);
+
+    taskHandle->state = "Running";
+    taskHandle->startTimer(std::chrono::minutes(cmTaskTimeoutMinutes));
+    taskHandle->payload.emplace(std::move(payload));
+
+    // Now set the property on inventory dbus. If the property write
+    // fails, abort the task
+    sdbusplus::asio::setProperty(
+        *crow::connections::systemBus, service, inventoryPath,
+        "xyz.openbmc_project.State.ReadyToRemove", "ReadyToRemove",
+        readyToRemove,
+        [asyncResp, taskHandle](const boost::system::error_code& ec2,
+                                const sdbusplus::message_t& /*msg*/) {
+            if (ec2)
+            {
+                BMCWEB_LOG_ERROR("Failed to set ReadyToRemove: {}",
+                                 ec2.message());
+                taskHandle->messages.emplace_back(messages::internalError());
+                taskHandle->state = "Exception";
+                taskHandle->status = "Warning";
+                taskHandle->finishTask();
+                messages::internalError(asyncResp->res);
+                return;
+            }
+            // Property write succeeded, commit 202 Accepted.
+            taskHandle->populateResp(asyncResp->res);
+        });
+}
+
+/**
+ * @brief Set ReadyToRemove on the inventory D-Bus object and start a task to
+ *        track the CM operation.
+ *
+ * @param asyncResp     Shared response, populateResp() sets 202 Accepted.
+ * @param payload       Task payload built from the original PATCH request.
+ * @param inventoryPath D-Bus object path of the inventory FRU.
+ * @param readyToRemove true: remove flow; false: add flow.
+ */
+inline void afterCheckCmNotBusy(
+    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+    task::Payload&& payload, const std::string& inventoryPath,
+    bool readyToRemove)
+{
+    dbus::utility::getDbusObject(
+        inventoryPath,
+        std::array<std::string_view, 1>{
+            "xyz.openbmc_project.State.ReadyToRemove"},
+        [asyncResp, payload = std::move(payload), inventoryPath,
+         readyToRemove](const boost::system::error_code& ec,
+                        const dbus::utility::MapperGetObject& object) mutable {
+            afterResolveReadyToRemoveService(asyncResp, std::move(payload),
+                                             inventoryPath, readyToRemove, ec,
+                                             object);
+        });
+}
+
+/**
+ * @brief Create a Redfish task tracking a Concurrent Maintenance operation.
+ *
+ * @param asyncResp     Shared response populateResp() sets 202 Accepted.
+ * @param payload       Task payload built from the original PATCH request.
+ * @param inventoryPath D-Bus object path of the inventory FRU.
+ * @param readyToRemove true: remove flow; false: add flow.
+ */
+inline void startCmTask(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+                        task::Payload&& payload,
+                        const std::string& inventoryPath, bool readyToRemove)
+{
+    checkCmNotBusy(asyncResp, inventoryPath,
+                   [asyncResp, payload = std::move(payload), inventoryPath,
+                    readyToRemove]() mutable {
+                       afterCheckCmNotBusy(asyncResp, std::move(payload),
+                                           inventoryPath, readyToRemove);
+                   });
+}
 
 /**
  * @brief Get Location code for the given assembly.
@@ -77,39 +327,30 @@ inline void getAssemblyLocationCode(
         });
 }
 
-inline void getAssemblyState(
+inline void getAssemblyReadyToRemove(
     const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
     const auto& serviceName, const auto& assembly,
     const nlohmann::json::json_pointer& assemblyJsonPtr)
 {
-    asyncResp->res.jsonValue[assemblyJsonPtr]["Status"]["State"] =
-        resource::State::Enabled;
-
-    dbus::utility::getProperty<bool>(
-        serviceName, assembly, "xyz.openbmc_project.Inventory.Item", "Present",
-        [asyncResp, assemblyJsonPtr,
-         assembly](const boost::system::error_code& ec, const bool value) {
-            if (ec)
-            {
-                if (ec.value() != EBADR)
+    std::string fru = sdbusplus::message::object_path(assembly).filename();
+    if (fru == "panel0" || fru == "panel1")
+    {
+        dbus::utility::getProperty<bool>(
+            serviceName, assembly, "xyz.openbmc_project.Inventory.Item",
+            "Present",
+            [asyncResp, assemblyJsonPtr,
+             assembly](const boost::system::error_code& ec, const bool value) {
+                if (ec)
                 {
-                    BMCWEB_LOG_ERROR("DBUS response error: {}", ec.value());
-                    messages::internalError(asyncResp->res);
+                    if (ec.value() != EBADR)
+                    {
+                        BMCWEB_LOG_ERROR("DBUS response error: {}", ec.value());
+                        messages::internalError(asyncResp->res);
+                    }
+                    return;
                 }
-                return;
-            }
 
-            if (!value)
-            {
-                asyncResp->res.jsonValue[assemblyJsonPtr]["Status"]["State"] =
-                    resource::State::Absent;
-            }
-
-            std::string fru =
-                sdbusplus::message::object_path(assembly).filename();
-            // Special handling for LCD and base panel CM.
-            if (fru == "panel0" || fru == "panel1")
-            {
+                // Special handling for LCD and base panel CM.
                 asyncResp->res.jsonValue[assemblyJsonPtr]["Oem"]["OpenBMC"]
                                         ["@odata.type"] =
                     "#OpenBMCAssembly.v1_0_0.OpenBMC";
@@ -118,38 +359,81 @@ inline void getAssemblyState(
                 // can be placed.
                 asyncResp->res.jsonValue[assemblyJsonPtr]["Oem"]["OpenBMC"]
                                         ["ReadyToRemove"] = !value;
-            }
-        });
+            });
+    }
 }
 
-void getAssemblyHealth(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
-                       const auto& serviceName, const auto& assembly,
-                       const nlohmann::json::json_pointer& assemblyJsonPtr)
+/**
+ * @brief Populate ReadyToRemove for assemblies that implement
+ *        xyz.openbmc_project.State.ReadyToRemove.
+ */
+inline void afterGetAssemblyReadyToRemove(
+    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+    const nlohmann::json::json_pointer& assemblyJsonPtr,
+    const boost::system::error_code& ec, bool value)
 {
-    asyncResp->res.jsonValue[assemblyJsonPtr]["Status"]["Health"] =
-        resource::Health::OK;
+    if (ec)
+    {
+        if (ec.value() != EBADR)
+        {
+            BMCWEB_LOG_ERROR("DBUS response error: {}", ec.value());
+            messages::internalError(asyncResp->res);
+        }
+        return;
+    }
+    asyncResp->res.jsonValue[assemblyJsonPtr]["ReadyToRemove"] = value;
+}
 
+inline void getAssemblyReadyToRemove(
+    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+    const std::string& serviceName, const std::string& assembly,
+    const nlohmann::json::json_pointer& assemblyJsonPtr)
+{
     dbus::utility::getProperty<bool>(
-        serviceName, assembly,
-        "xyz.openbmc_project.State.Decorator.OperationalStatus", "Functional",
-        [asyncResp, assemblyJsonPtr](const boost::system::error_code& ec,
-                                     bool functional) {
-            if (ec)
-            {
-                if (ec.value() != EBADR)
-                {
-                    BMCWEB_LOG_ERROR("DBUS response error {}", ec.value());
-                    messages::internalError(asyncResp->res);
-                }
-                return;
-            }
+        serviceName, assembly, "xyz.openbmc_project.State.ReadyToRemove",
+        "ReadyToRemove",
+        std::bind_front(afterGetAssemblyReadyToRemove, asyncResp,
+                        assemblyJsonPtr));
+}
 
-            if (!functional)
-            {
-                asyncResp->res.jsonValue[assemblyJsonPtr]["Status"]["Health"] =
-                    resource::Health::Critical;
-            }
-        });
+inline void afterSetAssemblyReadyToRemove(
+    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+    const std::string& assembly, bool value,
+    const boost::system::error_code& ec,
+    const dbus::utility::MapperGetObject& object)
+{
+    if (ec)
+    {
+        if (ec.value() == EBADR)
+        {
+            messages::propertyUnknown(asyncResp->res, "ReadyToRemove");
+            return;
+        }
+        BMCWEB_LOG_ERROR("getDbusObject failed for ReadyToRemove on {}: {}",
+                         assembly, ec.message());
+        messages::internalError(asyncResp->res);
+        return;
+    }
+    if (object.empty())
+    {
+        messages::propertyUnknown(asyncResp->res, "ReadyToRemove");
+        return;
+    }
+    const std::string& service = object.begin()->first;
+    setDbusProperty(asyncResp, "ReadyToRemove", service, assembly,
+                    "xyz.openbmc_project.State.ReadyToRemove", "ReadyToRemove",
+                    value);
+}
+
+inline void setAssemblyReadyToRemove(
+    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+    const std::string& assembly, bool value)
+{
+    constexpr std::array<std::string_view, 1> readyToRemoveIface = {
+        "xyz.openbmc_project.State.ReadyToRemove"};
+    dbus::utility::getDbusObject(assembly, readyToRemoveIface,
+                                 std::bind_front(afterSetAssemblyReadyToRemove,
+                                                 asyncResp, assembly, value));
 }
 
 inline void afterGetDbusObject(
@@ -188,14 +472,22 @@ inline void afterGetDbusObject(
             }
             else if (interface == "xyz.openbmc_project.Inventory.Item")
             {
-                getAssemblyState(asyncResp, serviceName, assembly,
-                                 assemblyJsonPtr);
+                resource_utils::getResourceState(asyncResp, serviceName,
+                                                 assembly, assemblyJsonPtr);
+
+                getAssemblyReadyToRemove(asyncResp, serviceName, assembly,
+                                         assemblyJsonPtr);
             }
             else if (interface ==
                      "xyz.openbmc_project.State.Decorator.OperationalStatus")
             {
-                getAssemblyHealth(asyncResp, serviceName, assembly,
-                                  assemblyJsonPtr);
+                resource_utils::getResourceHealth(asyncResp, serviceName,
+                                                  assembly, assemblyJsonPtr);
+            }
+            else if (interface == "xyz.openbmc_project.State.ReadyToRemove")
+            {
+                getAssemblyReadyToRemove(asyncResp, serviceName, assembly,
+                                         assemblyJsonPtr);
             }
         }
     }
@@ -219,7 +511,7 @@ inline void getAssemblyProperties(
     for (const std::string& assembly : assemblies)
     {
         nlohmann::json::object_t item;
-        item["@odata.type"] = "#Assembly.v1_5_1.AssemblyData";
+        item["@odata.type"] = "#Assembly.v1_6_0.AssemblyData";
         item["@odata.id"] = boost::urls::format(
             "/redfish/v1/Chassis/{}/Assembly#/Assemblies/{}", chassisId,
             std::to_string(assemblyIndex));
@@ -347,7 +639,7 @@ inline void afterHandleChassisAssemblyPatch(
     const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
     const std::string& chassisID,
     std::vector<nlohmann::json::object_t>& assemblyData,
-    const boost::system::error_code& ec,
+    task::Payload&& payload, const boost::system::error_code& ec,
     const std::vector<std::string>& assemblyList)
 {
     if (ec)
@@ -358,16 +650,19 @@ inline void afterHandleChassisAssemblyPatch(
     }
 
     std::map<std::string, bool> locationIndicatorActiveMap;
+    std::map<std::string, bool> readyToRemoveMap;
     std::map<std::string, nlohmann::json> oemIndicatorMap;
 
     for (nlohmann::json::object_t& item : assemblyData)
     {
         std::optional<std::string> memberId;
         std::optional<bool> locationIndicatorActive;
+        std::optional<bool> readyToRemove;
         std::optional<nlohmann::json> oem;
-        if (!json_util::readJsonObject(item, asyncResp->res, "MemberId",
-                                       memberId, "LocationIndicatorActive",
-                                       locationIndicatorActive, "Oem", oem))
+        if (!json_util::readJsonObject(
+                item, asyncResp->res, "MemberId", memberId,
+                "LocationIndicatorActive", locationIndicatorActive,
+                "ReadyToRemove", readyToRemove, "Oem", oem))
         {
             return;
         }
@@ -381,7 +676,22 @@ inline void afterHandleChassisAssemblyPatch(
             else
             {
                 BMCWEB_LOG_WARNING(
-                    "Property Missing - MemberId must be included with LocationIndicatorActive ");
+                    "Property Missing - MemberId must be included with "
+                    "LocationIndicatorActive ");
+                messages::propertyMissing(asyncResp->res, "MemberId");
+                return;
+            }
+        }
+        if (readyToRemove)
+        {
+            if (memberId)
+            {
+                readyToRemoveMap[*memberId] = *readyToRemove;
+            }
+            else
+            {
+                BMCWEB_LOG_WARNING(
+                    "Property Missing - MemberId must be included with ReadyToRemove");
                 messages::propertyMissing(asyncResp->res, "MemberId");
                 return;
             }
@@ -402,7 +712,17 @@ inline void afterHandleChassisAssemblyPatch(
         }
     }
 
+    // Only one ReadyToRemove CM operation is allowed per PATCH
+    if (readyToRemoveMap.size() > 1)
+    {
+        messages::propertyNotWritable(asyncResp->res, "ReadyToRemove");
+        return;
+    }
+
     std::size_t assemblyIndex = 0;
+    std::optional<std::string> cmAssemblyPath;
+    std::optional<bool> cmReadyToRemove;
+
     for (const auto& assembly : assemblyList)
     {
         auto iter =
@@ -492,7 +812,21 @@ inline void afterHandleChassisAssemblyPatch(
                 return;
             }
         }
+
+        auto iter3 = readyToRemoveMap.find(std::to_string(assemblyIndex));
+        if (iter3 != readyToRemoveMap.end())
+        {
+            cmAssemblyPath = assembly;
+            cmReadyToRemove = iter3->second;
+        }
+
         assemblyIndex++;
+    }
+
+    if (cmAssemblyPath)
+    {
+        startCmTask(asyncResp, std::move(payload), *cmAssemblyPath,
+                    *cmReadyToRemove);
     }
 }
 
@@ -513,10 +847,17 @@ inline void handleChassisAssemblyPatch(
         return;
     }
 
+    auto payload = task::Payload(req);
     assembly_utils::getChassisAssembly(
         asyncResp, chassisID,
-        std::bind_front(afterHandleChassisAssemblyPatch, asyncResp, chassisID,
-                        assemblyData));
+        [asyncResp, chassisID, assemblyData = std::move(assemblyData),
+         payload = std::move(payload)](
+            const boost::system::error_code& ec,
+            const std::vector<std::string>& assemblyList) mutable {
+            afterHandleChassisAssemblyPatch(asyncResp, chassisID, assemblyData,
+                                            std::move(payload), ec,
+                                            assemblyList);
+        });
 }
 
 /**

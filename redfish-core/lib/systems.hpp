@@ -20,6 +20,7 @@
 #include "logging.hpp"
 #include "oem/ibm/lamp_test.hpp"
 #include "oem/ibm/pcie_topology_refresh.hpp"
+#include "oem/ibm/service_alerts.hpp"
 #include "oem/ibm/system_attention_indicator.hpp"
 #include "query.hpp"
 #include "redfish_util.hpp"
@@ -2297,6 +2298,7 @@ inline void getChapData(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp)
             oemIBM["@odata.type"] = "#IBMComputerSystem.v1_0_0.IBM";
 
             nlohmann::json& chapData = oemIBM["ChapData"];
+            chapData["@odata.type"] = "#IBMComputerSystem.v1_0_0.ChapData";
             chapData["ChapName"] = *chapName;
             chapData["ChapSecret"] = *chapSecret;
         });
@@ -2305,7 +2307,8 @@ inline void getChapData(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp)
 /*
  * Set ChapData
  */
-inline void setChapData(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
+inline void setChapData(const crow::Request& req,
+                        const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
                         std::optional<std::string> chapName,
                         std::optional<std::string> chapSecret)
 {
@@ -2327,6 +2330,7 @@ inline void setChapData(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
 
     if (chapSecret)
     {
+        req.setSkipAuditDetail(true);
         sdbusplus::asio::setProperty(
             *crow::connections::systemBus, "xyz.openbmc_project.PLDM",
             "/xyz/openbmc_project/pldm", "com.ibm.PLDM.ChapData", "ChapSecret",
@@ -2424,6 +2428,22 @@ inline void setIdlePowerSaver(
                     "xyz.openbmc_project.Control.Power.IdlePowerSaver",
                     "Enabled", *ipsEnable);
             }
+            if (ipsExitUtil)
+            {
+                setDbusProperty(
+                    asyncResp, "IdlePowerSaver/ExitUtilizationPercent", service,
+                    path, "xyz.openbmc_project.Control.Power.IdlePowerSaver",
+                    "ExitUtilizationPercent", *ipsExitUtil);
+            }
+            if (ipsExitTime)
+            {
+                // Convert from seconds into milliseconds for DBus
+                const uint64_t timeMilliseconds = *ipsExitTime * 1000;
+                setDbusProperty(
+                    asyncResp, "IdlePowerSaver/ExitDwellTimeSeconds", service,
+                    path, "xyz.openbmc_project.Control.Power.IdlePowerSaver",
+                    "ExitDwellTime", timeMilliseconds);
+            }
             if (ipsEnterUtil)
             {
                 setDbusProperty(
@@ -2440,22 +2460,6 @@ inline void setIdlePowerSaver(
                     asyncResp, "IdlePowerSaver/EnterDwellTimeSeconds", service,
                     path, "xyz.openbmc_project.Control.Power.IdlePowerSaver",
                     "EnterDwellTime", timeMilliseconds);
-            }
-            if (ipsExitUtil)
-            {
-                setDbusProperty(
-                    asyncResp, "IdlePowerSaver/ExitUtilizationPercent", service,
-                    path, "xyz.openbmc_project.Control.Power.IdlePowerSaver",
-                    "ExitUtilizationPercent", *ipsExitUtil);
-            }
-            if (ipsExitTime)
-            {
-                // Convert from seconds into milliseconds for DBus
-                const uint64_t timeMilliseconds = *ipsExitTime * 1000;
-                setDbusProperty(
-                    asyncResp, "IdlePowerSaver/ExitDwellTimeSeconds", service,
-                    path, "xyz.openbmc_project.Control.Power.IdlePowerSaver",
-                    "ExitDwellTime", timeMilliseconds);
             }
         });
 
@@ -2817,6 +2821,10 @@ inline void handleComputerSystemGet(
         getSAI(asyncResp, "PartitionSystemAttentionIndicator");
         getSAI(asyncResp, "PlatformSystemAttentionIndicator");
     }
+    if constexpr (BMCWEB_HW_ISOLATION)
+    {
+        getServiceAlertsEnabled(asyncResp);
+    }
     if constexpr (BMCWEB_REDFISH_PROVISIONING_FEATURE)
     {
         getProvisioningStatus(asyncResp);
@@ -2829,8 +2837,8 @@ inline void handleComputerSystemGet(
     getEnabledPanelFunctions(asyncResp);
 
     nlohmann::json& actionOem = asyncResp->res.jsonValue["Actions"]["Oem"];
-    actionOem["#IBMComputerSystem.v1_0_0.ExecutePanelFunction"]["target"] =
-        "/redfish/v1/Systems/system/Actions/Oem/IBM/IBMComputerSystem.ExecutePanelFunction";
+    actionOem["#IBMComputerSystem.ExecutePanelFunction"]["target"] =
+        "/redfish/v1/Systems/system/Actions/Oem/IBMComputerSystem.ExecutePanelFunction";
 
     // ChapData
     getChapData(asyncResp);
@@ -2886,6 +2894,7 @@ inline void handleComputerSystemPatch(
     std::optional<bool> lampTest;
     std::optional<bool> partitionSAI;
     std::optional<bool> platformSAI;
+    std::optional<bool> sendServiceAlerts;
 
     if constexpr (BMCWEB_IBM_LED_EXTENSIONS)
     {
@@ -2914,7 +2923,8 @@ inline void handleComputerSystemPatch(
                 "Oem/IBM/SavePCIeTopologyInfo", savePCIeTopologyInfo,      //
                 "Oem/IBM/LampTest", lampTest,                              //
                 "Oem/IBM/PartitionSystemAttentionIndicator", partitionSAI, //
-                "Oem/IBM/PlatformSystemAttentionIndicator", platformSAI    //
+                "Oem/IBM/PlatformSystemAttentionIndicator", platformSAI,   //
+                "Oem/IBM/SendServiceAlerts", sendServiceAlerts             //
                 ))
         {
             return;
@@ -2944,7 +2954,8 @@ inline void handleComputerSystemPatch(
                 "Oem/IBM/ChapData/ChapName", chapName,                     //
                 "Oem/IBM/ChapData/ChapSecret", chapSecret,                 //
                 "Oem/IBM/PCIeTopologyRefresh", pcieTopologyRefresh,        //
-                "Oem/IBM/SavePCIeTopologyInfo", savePCIeTopologyInfo       //
+                "Oem/IBM/SavePCIeTopologyInfo", savePCIeTopologyInfo,      //
+                "Oem/IBM/SendServiceAlerts", sendServiceAlerts             //
                 ))
         {
             return;
@@ -3047,6 +3058,14 @@ inline void handleComputerSystemPatch(
         }
     }
 
+    if constexpr (BMCWEB_HW_ISOLATION)
+    {
+        if (sendServiceAlerts)
+        {
+            setServiceAlertsEnabled(asyncResp, *sendServiceAlerts);
+        }
+    }
+
     if (ipsEnable || ipsEnterUtil || ipsEnterTime || ipsExitUtil || ipsExitTime)
     {
         setIdlePowerSaver(asyncResp, ipsEnable, ipsEnterUtil, ipsEnterTime,
@@ -3055,7 +3074,7 @@ inline void handleComputerSystemPatch(
 
     if (chapName || chapSecret)
     {
-        setChapData(asyncResp, chapName, chapSecret);
+        setChapData(req, asyncResp, chapName, chapSecret);
     }
 
     if (pcieTopologyRefresh)
@@ -3283,7 +3302,7 @@ inline void requestRoutesSystemActionsOemExecutePanelFunction(App& app)
 {
     BMCWEB_ROUTE(
         app,
-        "/redfish/v1/Systems/system/Actions/Oem/IBM/IBMComputerSystem.ExecutePanelFunction/")
+        "/redfish/v1/Systems/system/Actions/Oem/IBMComputerSystem.ExecutePanelFunction/")
         .privileges(redfish::privileges::postComputerSystem)
         .methods(boost::beast::http::verb::post)(std::bind_front(
             handleSystemActionsOemExecutePanelFunctionPost, std::ref(app)));

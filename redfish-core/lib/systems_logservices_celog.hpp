@@ -13,7 +13,6 @@
 #include "logging.hpp"
 #include "query.hpp"
 #include "registries/privilege_registry.hpp"
-#include "utils/dbus_utils.hpp"
 #include "utils/error_log_utils.hpp"
 #include "utils/json_utils.hpp"
 #include "utils/time_utils.hpp"
@@ -119,31 +118,6 @@ inline void dBusCELogEntryCollection(
         });
 }
 
-inline void updateManagementSystemAckProperty(
-    const std::optional<bool>& resolved,
-    const std::optional<bool>& managementSystemAck,
-    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
-    const std::string& entryId)
-{
-    if (resolved.has_value())
-    {
-        setDbusProperty(asyncResp, "Resolved", "xyz.openbmc_project.Logging",
-                        "/xyz/openbmc_project/logging/entry/" + entryId,
-                        "xyz.openbmc_project.Logging.Entry", "Resolved",
-                        *resolved);
-    }
-
-    if (managementSystemAck.has_value())
-    {
-        BMCWEB_LOG_DEBUG("Updated ManagementSystemAck Property");
-        setDbusProperty(asyncResp, "ManagementSystemAck",
-                        "xyz.openbmc_project.Logging",
-                        "/xyz/openbmc_project/logging/entry/" + entryId,
-                        "org.open_power.Logging.PEL.Entry",
-                        "ManagementSystemAck", *managementSystemAck);
-    }
-}
-
 inline void requestRoutesDBusCELogEntryCollection(App& app)
 {
     BMCWEB_ROUTE(app, "/redfish/v1/Systems/<str>/LogServices/CELog/Entries/")
@@ -195,6 +169,7 @@ inline void dBusCELogEntryPatch(
          entryId](const std::optional<bool>& hiddenPropVal) {
             if (!hiddenPropVal.value_or(false))
             {
+                // 'hiddenPropVal' is false if it is not a CELog record
                 messages::resourceNotFound(asyncResp->res, "LogEntry", entryId);
                 return;
             }
@@ -360,7 +335,12 @@ inline void requestRoutesDBusCELogEntryDownloadPelJson(App& app)
                                                        "LogEntry", entryID);
                             return;
                         }
-                        displayOemPelAttachment(asyncResp, entryID);
+
+                        boost::urls::url urlLogEntryPrefix = boost::urls::format(
+                            "/redfish/v1/Systems/{}/LogServices/CELog/Entries",
+                            BMCWEB_REDFISH_SYSTEM_URI_NAME);
+                        displayOemPelAttachment(asyncResp, urlLogEntryPrefix,
+                                                entryID);
                     });
             });
 }

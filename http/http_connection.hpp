@@ -110,19 +110,10 @@ class Connection :
     Connection& operator=(Connection&&) = delete;
 
     bool tlsVerifyCallback(bool preverified,
-                           boost::asio::ssl::verify_context& ctx)
+                           boost::asio::ssl::verify_context& /*ctx*/)
     {
         BMCWEB_LOG_DEBUG("{} tlsVerifyCallback called with preverified {}",
                          logPtr(this), preverified);
-        if (preverified)
-        {
-            mtlsSession = verifyMtlsUser(ip, ctx);
-            if (mtlsSession)
-            {
-                BMCWEB_LOG_DEBUG("{} Generated TLS session: {}", logPtr(this),
-                                 mtlsSession->uniqueId);
-            }
-        }
         const persistent_data::AuthConfigMethods& c =
             persistent_data::SessionStore::getInstance().getAuthMethodsConfig();
         if (c.tlsStrict)
@@ -213,10 +204,12 @@ class Connection :
     {
         BMCWEB_LOG_DEBUG("{} Connection started, total {}", logPtr(this),
                          connectionCount);
+        readClientIp();
         if (connectionCount >= 200)
         {
-            BMCWEB_LOG_CRITICAL("{} Max connection count exceeded.",
-                                logPtr(this));
+            BMCWEB_LOG_CRITICAL("{} Max connection count exceeded. Request {}",
+                                logPtr(this), ip.to_string());
+
             return;
         }
 
@@ -231,7 +224,6 @@ class Connection :
 
         startDeadline();
 
-        readClientIp();
         boost::beast::async_detect_ssl(
             adaptor.next_layer(), buffer,
             std::bind_front(&self_type::afterDetectSsl, this,
@@ -245,10 +237,23 @@ class Connection :
         buffer.consume(bytesParsed);
         if (ec)
         {
-            BMCWEB_LOG_ERROR("{} SSL handshake failed", logPtr(this));
+            BMCWEB_LOG_WARNING("{} SSL handshake failed", logPtr(this));
             return;
         }
         BMCWEB_LOG_DEBUG("{} SSL handshake succeeded", logPtr(this));
+
+        if constexpr (BMCWEB_MUTUAL_TLS_AUTH)
+        {
+            BMCWEB_LOG_DEBUG(
+                "{} Establishing mTLS session after handshake, session reused: {}",
+                logPtr(this), SSL_session_reused(adaptor.native_handle()) != 0);
+            mtlsSession = verifyMtlsUser(ip, adaptor.native_handle());
+            if (mtlsSession != nullptr)
+            {
+                BMCWEB_LOG_DEBUG("{} Generated TLS session: {}", logPtr(this),
+                                 mtlsSession->uniqueId);
+            }
+        }
         // If http2 is enabled, negotiate the protocol
         if constexpr (BMCWEB_HTTP2)
         {
@@ -698,6 +703,13 @@ class Connection :
                 ip, res, method, value.base(), mtlsSession);
         }
 
+        if (!handleContentLengthError())
+        {
+            return;
+        }
+
+        parse.body_limit(getContentLengthLimit());
+
         std::string_view expect = value[boost::beast::http::field::expect];
         if (bmcweb::asciiIEquals(expect, "100-continue"))
         {
@@ -705,13 +717,6 @@ class Connection :
             doWrite();
             return;
         }
-
-        if (!handleContentLengthError())
-        {
-            return;
-        }
-
-        parse.body_limit(getContentLengthLimit());
 
         if (parse.is_done())
         {

@@ -439,7 +439,10 @@ class ConnectionInfo : public std::enable_shared_from_this<ConnectionInfo>
         // Copy the response into a Response object so that it can be
         // processed by the callback function.
         res.response = parser->release();
-        callback(parser->keep_alive(), connId, res);
+        if (callback)
+        {
+            callback(parser->keep_alive(), connId, res);
+        }
         res.clear();
     }
 
@@ -487,7 +490,10 @@ class ConnectionInfo : public std::enable_shared_from_this<ConnectionInfo>
             // We want to return a 502 to indicate there was an error with
             // the external server
             res.result(boost::beast::http::status::bad_gateway);
-            callback(false, connId, res);
+            if (callback)
+            {
+                callback(false, connId, res);
+            }
             res.clear();
 
             // Reset the retrycount to zero so that client can try
@@ -597,11 +603,6 @@ class ConnectionInfo : public std::enable_shared_from_this<ConnectionInfo>
             return;
         }
 
-        if (host.host_type() != boost::urls::host_type::name)
-        {
-            // Avoid setting SNI hostname if its IP address
-            return;
-        }
         // Create a null terminated string for SSL
         std::string hostname(host.encoded_host_address());
         if (SSL_set_tlsext_host_name(sslConn->native_handle(),
@@ -715,7 +716,19 @@ class ConnectionPool : public std::enable_shared_from_this<ConnectionPool>
     // Otherwise closes the connection if it is not a keep-alive
     void sendNext(bool keepAlive, uint32_t connId)
     {
+        if (connId >= connections.size())
+        {
+            BMCWEB_LOG_ERROR("Invalid connId: {} (size: {})", connId,
+                             connections.size());
+            return;
+        }
+
         auto conn = connections[connId];
+        if (!conn)
+        {
+            BMCWEB_LOG_ERROR("Connection at index {} is null", connId);
+            return;
+        }
 
         // Allow the connection's handler to be deleted
         // This is needed because of Redfish Aggregation passing an
@@ -832,10 +845,6 @@ class ConnectionPool : public std::enable_shared_from_this<ConnectionPool>
                               const std::function<void(Response&)>& resHandler,
                               bool keepAlive, uint32_t connId, Response& res)
     {
-        // Allow provided callback to perform additional processing of the
-        // request
-        resHandler(res);
-
         // If requests remain in the queue then we want to reuse this
         // connection to send the next request
         std::shared_ptr<ConnectionPool> self = weakSelf.lock();
@@ -845,6 +854,10 @@ class ConnectionPool : public std::enable_shared_from_this<ConnectionPool>
                                 logPtr(self.get()));
             return;
         }
+
+        // Allow provided callback to perform additional processing of the
+        // request
+        resHandler(res);
 
         self->sendNext(keepAlive, connId);
     }
